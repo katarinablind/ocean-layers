@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ocean Layers</title>
+<link href="https://fonts.googleapis.com/css2?family=Mulish:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html { height:100%; }
+body { background:#f5f4f0; overflow-y:scroll; }
+#c { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; }
+#spacer { height:800vh; pointer-events:none; }
+
+/* ── HUD ── */
+#hud {
+  position:fixed; inset:0; pointer-events:none; z-index:10;
+  font-family:'Mulish', sans-serif;
+}
+
+/* depth track */
+#depth-track {
+  position:absolute; right:2.8rem; top:50%; transform:translateY(-50%);
+  display:flex; flex-direction:column; align-items:flex-end; gap:.5rem;
+  opacity:0; transition:opacity 1.2s ease;
+}
+#depth-lbl {
+  font-size:.48rem; letter-spacing:.35em; text-transform:uppercase;
+  color:rgba(20,20,20,.25); writing-mode:vertical-rl;
+  transform:rotate(180deg); margin-bottom:.4rem;
+  font-family:'Mulish', sans-serif; font-weight:300;
+}
+#depth-line { width:1px; height:110px; background:rgba(20,20,20,.08); position:relative; }
+#depth-fill {
+  position:absolute; bottom:0; left:0; width:100%;
+  background:linear-gradient(to top, rgba(20,20,20,.45), transparent);
+}
+#depth-val {
+  font-size:.72rem; letter-spacing:.08em; color:rgba(20,20,20,.28);
+  font-family:'Mulish', sans-serif; font-weight:600;
+}
+
+
+
+
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<div id="spacer"></div>
+
+<!-- HUD -->
+<div id="hud">
+  <div id="depth-track">
+    <div id="depth-lbl">depth</div>
+    <div id="depth-line"><div id="depth-fill"></div></div>
+    <div id="depth-val">0m</div>
+  </div>
+</div>
+
+
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════
+// RENDERER + SCENE
+// ═══════════════════════════════════════════
+const canvas   = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0xf5f4f0, 1);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(58, innerWidth/innerHeight, 0.1, 400);
+camera.position.set(0, 8, 52);
+camera.lookAt(0, 0, 0);
+
+scene.fog = new THREE.FogExp2(0xf5f4f0, 0.006);
+
+// ═══════════════════════════════════════════
+// SCROLL — native when standalone, postMessage when in Framer
+// ═══════════════════════════════════════════
+let rawP = 0, p = 0;
+
+// Native scroll (standalone use)
+window.addEventListener('scroll', () => {
+    const max = document.body.scrollHeight - innerHeight;
+    if (max > 0) rawP = Math.min(scrollY / max, 1);
+}, { passive: true });
+
+// postMessage from Framer parent
+window.addEventListener('message', (e) => {
+    if (e.data?.type === 'OCEAN_SCROLL') {
+        rawP = Math.max(0, Math.min(1, e.data.progress));
+    }
+});
+
+// ═══════════════════════════════════════════
+// GLSL SIMPLEX NOISE  (shared across all shaders)
+// ═══════════════════════════════════════════
+const SN = `
+vec3 _m3(vec3 x){return x-floor(x*(1./289.))*289.;}
+vec4 _m4(vec4 x){return x-floor(x*(1./289.))*289.;}
+vec4 _p4(vec4 x){return _m4(((x*34.)+1.)*x);}
+float snoise(vec3 v){
+  const vec2 C=vec2(1./6.,1./3.);
+  vec3 i=floor(v+dot(v,C.yyy)),x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz),l=1.-g,
+       i1=min(g,l.zxy),i2=max(g,l.zxy),
+       x1=x0-i1+C.x,x2=x0-i2+C.y,x3=x0-.5;
+  i=_m3(i);
+  vec4 pp=_p4(_p4(_p4(i.z+vec4(0,i1.z,i2.z,1))+i.y+vec4(0,i1.y,i2.y,1))+i.x+vec4(0,i1.x,i2.x,1));
+  vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);
+  m=m*m*m*m;
+  vec4 xv=2.*fract(pp/41.)-1.,h=abs(xv)-.5,ox=floor(xv+.5),a0=xv-ox;
+  m*=1.79284-.85374*(a0*a0+h*h);
+  vec4 gv;
+  gv.x=a0.x*x0.x+h.x*x0.y;
+  gv.yzw=a0.yzw*vec3(x1.x,x2.x,x3.x)+h.yzw*vec3(x1.y,x2.y,x3.y);
+  return 130.*dot(m,gv);
+}`;
+
+// ═══════════════════════════════════════════
+// WAVE LAYERS
+// ═══════════════════════════════════════════
+// 6 stacked wave planes at different Y depths.
+// Each has a slightly different noise phase, amplitude, colour.
+// As you descend they separate, tilt, and fade independently.
+// ═══════════════════════════════════════════
+
+const WAVE_VS = SN + `
+uniform float uTime;
+uniform float uAmp;
+uniform float uFreq;
+uniform float uPhaseX;
+uniform float uPhaseZ;
+uniform float uP;
+varying float vElev;
+varying vec2  vXZ;
+
+void main(){
+  vXZ = position.xz;
+
+  // Two octave wave
+  float e  = snoise(vec3(position.x*uFreq + uPhaseX,
+                         position.z*uFreq + uPhaseZ,
+                         uTime*.12)) * uAmp;
+       e += snoise(vec3(position.x*uFreq*2.1 + uPhaseX,
+                        position.z*uFreq*2.1 + uPhaseZ,
+                        uTime*.19 + 4.)) * uAmp * .32;
+  vElev = e;
+
+  vec3 pos = position;
+  pos.y += e;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.);
+}`;
+
+// Solid wave fragment — colour blends warm→cold with depth
+const WAVE_FS = `
+uniform float uP;
+uniform float uAlpha;
+uniform vec3  uColA;
+uniform vec3  uColB;
+varying float vElev;
+varying vec2  vXZ;
+
+void main(){
+  float t = smoothstep(-2., 2., vElev);
+  vec3 col = mix(uColA, uColB, t);
+  float edge = 1. - smoothstep(72., 105., length(vXZ));
+  gl_FragColor = vec4(col, uAlpha * edge);
+}`;
+
+// Wireframe fragment — shows contour lines briefly
+const WIRE_FS = `
+uniform float uP;
+uniform float uWireAlpha;
+uniform vec3  uColA;
+varying float vElev;
+
+void main(){
+  gl_FragColor = vec4(uColA * 1.4, uWireAlpha);
+}`;
+
+// Each layer definition
+const LAYER_DEFS = [
+  // { yBase, ampMult, freqMult, phX, phZ, colA, colB, wireCol, depthStart, depthEnd }
+  // Layer 0 — top surface, warm gold
+  { y: 0,   amp:1.0, freq:.82, phX:0,   phZ:0,   cA:0xc8921a, cB:0x4a7a9a, wC:0xe8b84a, dS:.04, dE:.55 },
+  // Layer 1 — steel blue, like mid-photo water colour
+  { y:-4.5, amp:.88, freq:.95, phX:3.1, phZ:1.4, cA:0x3a6888, cB:0x0e2840, wC:0x5a9ac8, dS:.08,  dE:.65 },
+  // Layer 2 — deeper, darker blue
+  { y:-9,   amp:.74, freq:1.1, phX:6.2, phZ:3.0, cA:0x1a5878, cB:0x081828, wC:0x1e90b0, dS:.10,  dE:.72 },
+  // Layer 3 — mid depth, navy
+  { y:-14,  amp:.58, freq:1.3, phX:1.8, phZ:5.5, cA:0x0e3858, cB:0x040e20, wC:0x1068a0, dS:.22,  dE:.80 },
+  // Layer 4 — deep, near black blue
+  { y:-20,  amp:.42, freq:1.5, phX:4.4, phZ:2.2, cA:0x082040, cB:0x020810, wC:0x0848a0, dS:.35,  dE:.88 },
+  // Layer 5 — abyss floor, very dark
+  { y:-27,  amp:.28, freq:1.8, phX:7.0, phZ:4.8, cA:0x040e1c, cB:0x010408, wC:0x0430a0, dS:.50,  dE:.98 },
+];
+
+// Shared geometry (all layers reuse same geo)
+const waveGeo = new THREE.PlaneGeometry(220, 220, 130, 130);
+waveGeo.rotateX(-Math.PI / 2);
+
+const waveLayers = [];
+
+LAYER_DEFS.forEach((def, i) => {
+  const uni = {
+    uTime:      { value: 0 },
+    uAmp:       { value: def.amp * 2.8 },
+    uFreq:      { value: def.freq * 0.025 },
+    uPhaseX:    { value: def.phX },
+    uPhaseZ:    { value: def.phZ },
+    uP:         { value: 0 },
+    uAlpha:     { value: 0 },
+    uWireAlpha: { value: 0 },
+    uColA:      { value: new THREE.Color(def.cA) },
+    uColB:      { value: new THREE.Color(def.cB) },
+  };
+
+  const solidMat = new THREE.ShaderMaterial({
+    uniforms: uni, transparent:true, depthWrite:false,
+    side:THREE.DoubleSide,
+    vertexShader: WAVE_VS, fragmentShader: WAVE_FS,
+  });
+
+  const wireMat = new THREE.ShaderMaterial({
+    uniforms: {
+      ...uni,
+      uColA: { value: new THREE.Color(def.wC) },
+    },
+    transparent:true, depthWrite:false, wireframe:true,
+    side:THREE.DoubleSide,
+    vertexShader: WAVE_VS, fragmentShader: WIRE_FS,
+  });
+
+  const solidMesh = new THREE.Mesh(waveGeo, solidMat);
+  const wireMesh  = new THREE.Mesh(waveGeo, wireMat);
+  solidMesh.position.y = def.y;
+  wireMesh.position.y  = def.y;
+
+  scene.add(solidMesh);
+  scene.add(wireMesh);
+
+  waveLayers.push({ solidMat, wireMat, solidMesh, wireMesh, def, uni });
+});
+
+// ═══════════════════════════════════════════
+// SUN SHIMMER — sparkles on the top surface
+// ═══════════════════════════════════════════
+const SHIMMER_N = 35000;
+const shimPos = new Float32Array(SHIMMER_N * 3);
+const shimPh  = new Float32Array(SHIMMER_N);
+const shimSz  = new Float32Array(SHIMMER_N);
+
+for(let i = 0; i < SHIMMER_N; i++){
+  const i3 = i*3;
+  const a = Math.random() * Math.PI * 2;
+  const r = Math.pow(Math.random(), .5) * 80;
+  shimPos[i3]   = Math.cos(a)*r;
+  shimPos[i3+1] = 0;
+  shimPos[i3+2] = Math.sin(a)*r;
+  shimPh[i]  = Math.random() * Math.PI * 2;
+  shimSz[i]  = Math.random();
+}
+
+const shimGeo = new THREE.BufferGeometry();
+shimGeo.setAttribute('position', new THREE.BufferAttribute(shimPos, 3));
+shimGeo.setAttribute('aPh',      new THREE.BufferAttribute(shimPh,  1));
+shimGeo.setAttribute('aSz',      new THREE.BufferAttribute(shimSz,  1));
+
+const shimUni = { uTime:{value:0}, uP:{value:0}, uPR:{value:renderer.getPixelRatio()} };
+
+const shimMat = new THREE.ShaderMaterial({
+  uniforms: shimUni, transparent:true,
+  depthWrite:false, blending:THREE.AdditiveBlending,
+  vertexShader: SN + `
+uniform float uTime, uP, uPR;
+attribute float aPh, aSz;
+varying float vA; varying vec3 vC;
+
+void main(){
+  vec3 pos = position;
+
+  // Ride the top wave
+  float e  = snoise(vec3(pos.x*.024, pos.z*.024, uTime*.11))*1.1
+            +snoise(vec3(pos.x*.055, pos.z*.055, uTime*.17+3.))*.28;
+  pos.y = e;
+
+  // Caustic micro-drift
+  pos.x += snoise(vec3(aPh*2.,   uTime*.07, 0.))*2.2;
+  pos.z += snoise(vec3(aPh*2.+5.,uTime*.06, 1.))*2.2;
+
+  // Fade in from nothing (bg is white, shimmer would look odd), then fade out going under
+  float vis = smoothstep(.05, .18, uP) * (1. - smoothstep(.0, .38, uP));
+
+  // Warm gold near center, cooler blue-white at edges
+  float warm = smoothstep(55., 0., length(pos.xz));
+  vC = mix(
+    vec3(.58,.72,.84),
+    mix(vec3(.99,.97,.90), vec3(1.,.82,.38), warm*.7),
+    warm
+  );
+
+  float twinkle = .38 + .62*sin(uTime*4.1 + aPh*9.5);
+  float sz = mix(.4, 3.4, aSz*aSz) * uPR;
+  gl_PointSize = sz * (195. / -(modelViewMatrix*vec4(pos,1.)).z);
+  vA = vis * twinkle * (.2 + aSz*.72);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.);
+}`,
+  fragmentShader:`
+varying float vA; varying vec3 vC;
+void main(){
+  vec2 uv = gl_PointCoord-.5; float d=length(uv);
+  if(d>.5) discard;
+  float core =1.-smoothstep(0.,.12,d);
+  float mid  =1.-smoothstep(.08,.4, d);
+  float outer=1.-smoothstep(.28,.5, d);
+  // Star cross flare
+  float cx=max(0.,(1.-abs(uv.x)*20.))*max(0.,(1.-d*2.));
+  float cy=max(0.,(1.-abs(uv.y)*20.))*max(0.,(1.-d*2.));
+  float flare=max(cx,cy)*.3;
+  float a=vA*(core*.55+mid*.32+outer*.13+flare);
+  gl_FragColor=vec4(vC+flare*.3, clamp(a,0.,1.));
+}`,
+});
+scene.add(new THREE.Points(shimGeo, shimMat));
+
+// ═══════════════════════════════════════════
+// DEEP PARTICLES — underwater volumetric fill
+// These mix into the wave layers as you go deeper
+// ═══════════════════════════════════════════
+const DEEP_N = 60000;
+const dPos = new Float32Array(DEEP_N * 3);
+const dPh  = new Float32Array(DEEP_N);
+const dSz  = new Float32Array(DEEP_N);
+const dRole= new Float32Array(DEEP_N); // 0=scatter, 1=bio
+
+for(let i = 0; i < DEEP_N; i++){
+  const i3 = i*3;
+  const a = Math.random()*Math.PI*2;
+  const r = Math.pow(Math.random(), .45) * 70;
+  dPos[i3]   = Math.cos(a)*r;
+  dPos[i3+1] = -(Math.random() * 70);  // depth 0..70 below surface
+  dPos[i3+2] = Math.sin(a)*r;
+  dPh[i]  = Math.random()*Math.PI*2;
+  dSz[i]  = Math.random();
+  dRole[i]= i < DEEP_N * .65 ? 0 : 1; // 65% scatter, 35% bioluminescent
+}
+
+const deepGeo = new THREE.BufferGeometry();
+deepGeo.setAttribute('position', new THREE.BufferAttribute(dPos,  3));
+deepGeo.setAttribute('aPh',      new THREE.BufferAttribute(dPh,   1));
+deepGeo.setAttribute('aSz',      new THREE.BufferAttribute(dSz,   1));
+deepGeo.setAttribute('aRole',    new THREE.BufferAttribute(dRole, 1));
+
+const deepUni = { uTime:{value:0}, uP:{value:0}, uPR:{value:renderer.getPixelRatio()} };
+
+const deepMat = new THREE.ShaderMaterial({
+  uniforms: deepUni, transparent:true,
+  depthWrite:false, blending:THREE.AdditiveBlending,
+  vertexShader: SN + `
+uniform float uTime, uP, uPR;
+attribute float aPh, aSz, aRole;
+varying float vA; varying vec3 vC; varying float vRole;
+
+void main(){
+  vec3 pos = position;
+  vRole = aRole;
+
+  // Volumetric drift — slow cross-currents driven by noise
+  pos.x += snoise(vec3(pos.y*.018+aPh, uTime*.045, 0.))*4.5;
+  pos.z += snoise(vec3(pos.y*.018+aPh, uTime*.040, 5.))*4.5;
+  pos.y += sin(uTime*.3+aPh*4.)*1.4;
+
+  if(aRole < .5){
+    // ── SCATTER — cold blue rays filtering down ──
+    float vis = smoothstep(.12,.32,uP) * (1.-smoothstep(.80,.96,uP));
+    float depthT = smoothstep(0.,-65.,pos.y);
+    vC = mix(vec3(.18,.62,.92), vec3(.02,.18,.48), depthT);
+    float sz = (.4+aSz*1.9)*uPR*(220./-(modelViewMatrix*vec4(pos,1.)).z);
+    gl_PointSize = max(sz,0.);
+    vA = vis*(.10+aSz*.35);
+
+  } else {
+    // ── BIOLUMINESCENT — cyan-teal orbs ──
+    pos.x += snoise(vec3(aPh*3.,   uTime*.055, 0.))*2.5;
+    pos.z += snoise(vec3(aPh*3.+7.,uTime*.048, 3.))*2.5;
+
+    float vis   = smoothstep(.30,.50,uP)*(1.-smoothstep(.85,.99,uP));
+    float pulse = .5+.5*sin(uTime*2.3+aPh*14.);
+    vC = mix(vec3(.0,.85,.76), vec3(.22,.62,.96), aSz);
+    float sz = (.6+aSz*2.2)*uPR*(210./-(modelViewMatrix*vec4(pos,1.)).z);
+    gl_PointSize = max(sz,0.);
+    vA = vis*(.18+aSz*.5)*(.5+.5*pulse);
+  }
+
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.);
+}`,
+  fragmentShader:`
+varying float vA; varying vec3 vC; varying float vRole;
+void main(){
+  vec2 uv=gl_PointCoord-.5; float d=length(uv);
+  if(d>.5) discard;
+  float core=1.-smoothstep(0.,.10,d);
+  float glow=1.-smoothstep(.05,.50,d);
+  // Bioluminescent: white-hot core
+  vec3 col = vRole>.5 ? mix(vC,vec3(1.),core*.55) : vC;
+  float a = vA*(core*.58+glow*.42);
+  gl_FragColor=vec4(col, clamp(a,0.,1.));
+}`,
+});
+scene.add(new THREE.Points(deepGeo, deepMat));
+
+// ═══════════════════════════════════════════
+// GOD RAYS — vertical light shafts, appear shallow
+// ═══════════════════════════════════════════
+const rayGroup = new THREE.Group();
+const rayMats  = [];
+
+for(let b = 0; b < 18; b++){
+  const ang = (b/18)*Math.PI*2;
+  const rad = 4 + Math.random()*20;
+  const h   = 20 + Math.random()*24;
+  const w   = .18 + Math.random()*.7;
+
+  const geo = new THREE.PlaneGeometry(w, h);
+  const mat = new THREE.ShaderMaterial({
+    uniforms:{ uP:{value:0}, uTime:{value:0}, uB:{value:b/18} },
+    transparent:true, depthWrite:false,
+    blending:THREE.AdditiveBlending, side:THREE.DoubleSide,
+    vertexShader:`
+uniform float uTime, uB;
+varying vec2 vUv;
+void main(){
+  vUv=uv;
+  vec3 pos=position;
+  pos.x+=sin(uTime*.22+uB*6.28)*.35*uv.y;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(pos,1.);
+}`,
+    fragmentShader:`
+uniform float uP, uB;
+varying vec2 vUv;
+void main(){
+  float vis=smoothstep(.04,.2,uP)*(1.-smoothstep(.34,.52,uP));
+  float vF=pow(1.-vUv.y,1.6);
+  float hF=1.-abs(vUv.x*2.-1.); hF=pow(hF,1.3);
+  float flicker=.72+.28*sin(uB*51.+uP*7.);
+  float a=vis*vF*hF*flicker*.16;
+  vec3 col=mix(vec3(.6,.82,.96),vec3(.99,.97,.88),vF*.5);
+  gl_FragColor=vec4(col,clamp(a,0.,1.));
+}`,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(
+    Math.cos(ang)*rad,
+    -h*.5 + .5,
+    Math.sin(ang)*rad
+  );
+  mesh.rotation.y = ang;
+  rayGroup.add(mesh);
+  rayMats.push(mat);
+}
+scene.add(rayGroup);
+
+// ═══════════════════════════════════════════
+// STARS — appear at the very end, subtle
+// ═══════════════════════════════════════════
+const STAR_N = 4000;
+const stPos = new Float32Array(STAR_N * 3);
+const stPh  = new Float32Array(STAR_N);
+const stSz  = new Float32Array(STAR_N);
+for(let i = 0; i < STAR_N; i++){
+  const i3 = i*3;
+  const a1 = Math.random()*Math.PI*2, a2 = Math.acos(2*Math.random()-1);
+  const r  = 80 + Math.random()*60;
+  stPos[i3]   = r*Math.sin(a2)*Math.cos(a1);
+  stPos[i3+1] = r*Math.sin(a2)*Math.sin(a1) * .45; // flatten to disc
+  stPos[i3+2] = r*Math.cos(a2);
+  stPh[i] = Math.random()*Math.PI*2;
+  stSz[i] = Math.random();
+}
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(stPos,3));
+starGeo.setAttribute('aPh',      new THREE.BufferAttribute(stPh, 1));
+starGeo.setAttribute('aSz',      new THREE.BufferAttribute(stSz, 1));
+
+const starUni = { uTime:{value:0}, uP:{value:0}, uPR:{value:renderer.getPixelRatio()} };
+const starMat = new THREE.ShaderMaterial({
+  uniforms:starUni, transparent:true,
+  depthWrite:false, blending:THREE.AdditiveBlending,
+  vertexShader:`
+uniform float uTime, uP, uPR;
+attribute float aPh, aSz;
+varying float vA; varying vec3 vC;
+void main(){
+  vec3 pos = position;
+  // Slow drift — like they're drifting past
+  pos.x += sin(uTime*.04 + aPh*2.)*1.2;
+  pos.y += cos(uTime*.03 + aPh*3.)*0.8;
+
+  // Only appear in the last 25% of scroll
+  float vis = smoothstep(.75, .92, uP);
+  float twinkle = .55 + .45*sin(uTime*2.8 + aPh*17.);
+  vA = vis * twinkle * (.25 + aSz*.6);
+
+  // Colour: mostly cold white, a few warm and a few violet
+  float hue = fract(aPh*.31);
+  vC = mix(
+    mix(vec3(.85,.88,1.), vec3(1.,.96,.84), step(.8, hue)),
+    mix(vec3(.85,.88,1.), vec3(.78,.72,1.), step(.9, hue)),
+    step(.9, hue)
+  );
+
+  vec4 mv = modelViewMatrix * vec4(pos, 1.);
+  gl_PointSize = (.5 + aSz*1.8) * uPR * (180. / -mv.z);
+  gl_Position  = projectionMatrix * mv;
+}`,
+  fragmentShader:`
+varying float vA; varying vec3 vC;
+void main(){
+  vec2 uv=gl_PointCoord-.5; float d=length(uv);
+  if(d>.5) discard;
+  float g = 1.-smoothstep(.0,.5,d);
+  gl_FragColor = vec4(vC, vA*g*g);
+}`,
+});
+scene.add(new THREE.Points(starGeo, starMat));
+
+// ═══════════════════════════════════════════
+// CAMERA + FOG
+// ═══════════════════════════════════════════
+function sm(t){ return t*t*(3-2*t); }
+
+function updateCamera(pp){
+  const now = performance.now()*.001;
+  // Surface: high up, looking slightly down at waves
+  // Deep: descend, tilt down, pull back slightly
+  const y  = THREE.MathUtils.lerp( 8,  -30, pp);
+  const z  = THREE.MathUtils.lerp(52,   64, Math.min(pp*2,1));
+  const rx = THREE.MathUtils.lerp( 0, -.10, Math.min(pp/.6,1));
+  const fv = THREE.MathUtils.lerp(58,   66, pp);
+
+  // Idle bob and sway at surface — feels like you're floating
+  const bob  = Math.sin(now*.6) * .28 * (1-Math.min(pp*5,1));
+  const swayX= Math.sin(now*.22)* .7  * (1-Math.min(pp*3,1));
+
+  camera.position.set(swayX, y+bob, z);
+  camera.rotation.x = rx;
+  camera.fov = fv;
+  camera.updateProjectionMatrix();
+}
+
+function updateFog(pp){
+  // White (surface) → deep navy (ocean) → near-black with faint violet (space)
+  // Split into two lerps: 0→0.5 = white to deep, 0.5→1.0 = deep to space-black
+  let r, g, b;
+  if(pp < .5){
+    const t = sm(pp * 2);
+    r = THREE.MathUtils.lerp(245, 2,   t) / 255;
+    g = THREE.MathUtils.lerp(244, 13,  t) / 255;
+    b = THREE.MathUtils.lerp(240, 26,  t) / 255;
+  } else {
+    const t = sm((pp - .5) * 2);
+    r = THREE.MathUtils.lerp(2,  2,  t) / 255;
+    g = THREE.MathUtils.lerp(13, 2,  t) / 255;
+    b = THREE.MathUtils.lerp(26, 10, t) / 255;
+  }
+  scene.fog.color.setRGB(r, g, b);
+  scene.fog.density = THREE.MathUtils.lerp(.001, .022, Math.min(pp * 1.5, 1));
+  renderer.setClearColor(scene.fog.color, 1);
+}
+
+// ═══════════════════════════════════════════
+// WAVE LAYER ALPHA — each layer fades in/out
+// ═══════════════════════════════════════════
+function fadeRange(pp, s, e){
+  const fi = .06, fo = .06;
+  if(pp<s||pp>e+fo) return 0;
+  const fadeIn  = Math.min(1, (pp-s)/fi);
+  const fadeOut = Math.min(1, (e+fo-pp)/fo);
+  return Math.min(fadeIn, fadeOut);
+}
+
+function updateWaveLayers(pp, now){
+  waveLayers.forEach((layer, i) => {
+    const def = layer.def;
+    const a = fadeRange(pp, def.dS, def.dE);
+
+    // Solid — deeper layers are more transparent; all fade in from white (start at 0)
+    const solidA = a * (.50 - i*.04);
+    layer.uni.uAlpha.value     = Math.max(0, solidA);
+    layer.uni.uTime.value      = now;
+    layer.uni.uP.value         = pp;
+
+    // Wire — only on the upper layers, at the transition moments
+    const wireA = a * Math.max(0, .22 - i*.028);
+    layer.wireMat.uniforms.uWireAlpha.value = Math.max(0, wireA);
+    layer.wireMat.uniforms.uTime.value      = now;
+
+    // As you descend, layers separate and tilt slightly
+    const sep = sm(Math.max(0, (pp-.1)/.5)); // starts separating at 10%
+    layer.solidMesh.position.y = def.y - sep * i * 1.2;
+    layer.wireMesh.position.y  = layer.solidMesh.position.y;
+
+    // Slow independent rotation per layer — feels geological
+    layer.solidMesh.rotation.y += (.00008 + i*.000015) * (1-Math.min(pp,1)*.6);
+    layer.wireMesh.rotation.y   = layer.solidMesh.rotation.y;
+  });
+}
+
+// ═══════════════════════════════════════════
+const depthFillEl = document.getElementById('depth-fill');
+const depthValEl  = document.getElementById('depth-val');
+function updateHUD(pp){
+  depthFillEl.style.height = (pp*100)+'%';
+  // Show depth track only once you've started descending
+  document.getElementById('depth-track').style.opacity = pp > .08 ? '1' : '0';
+  if(pp > .88){
+    depthValEl.textContent = '∞';
+  } else {
+    const d = Math.round(pp*pp*1300);
+    depthValEl.textContent = d>0 ? d.toLocaleString()+'m' : '0m';
+  }
+  // Shift HUD text dark→light as bg goes white→dark
+  const light = Math.min(1, Math.max(0, (pp-.1)/.15));
+  const hudColor = `rgba(${Math.round(255*light)},${Math.round(255*light)},${Math.round(255*light)},${.3+light*.35})`;
+  depthValEl.style.color    = hudColor;
+  document.getElementById('depth-lbl').style.color = hudColor;
+  document.getElementById('depth-fill').style.background =
+    `linear-gradient(to top, ${hudColor}, transparent)`;
+}
+
+// ═══════════════════════════════════════════
+// RESIZE
+// ═══════════════════════════════════════════
+window.addEventListener('resize',()=>{
+  renderer.setSize(innerWidth,innerHeight);
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  shimUni.uPR.value=renderer.getPixelRatio();
+  deepUni.uPR.value=renderer.getPixelRatio();
+  starUni.uPR.value=renderer.getPixelRatio();
+});
+
+// ═══════════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════════
+(function loop(){
+  requestAnimationFrame(loop);
+  const now = performance.now()*.001;
+
+  p += (rawP-p)*.028;
+
+
+  // Shimmer uniforms
+  shimUni.uTime.value = now;
+  shimUni.uP.value    = p;
+
+  // Deep particle uniforms
+  deepUni.uTime.value = now;
+  deepUni.uP.value    = p;
+
+  // Star uniforms
+  starUni.uTime.value = now;
+  starUni.uP.value    = p;
+
+  // Ray uniforms
+  rayMats.forEach(m=>{ m.uniforms.uP.value=p; m.uniforms.uTime.value=now; });
+
+  // Wave layers
+  updateWaveLayers(p, now);
+
+  updateFog(p);
+  updateCamera(p);
+  updateHUD(p);
+
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
