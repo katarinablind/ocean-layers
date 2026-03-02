@@ -8,7 +8,7 @@
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 html { height:100%; }
-body { background:#f5f4f0; overflow-y:scroll; }
+body { background:#ffffff; overflow-y:scroll; }
 #c { position:fixed; top:0; left:0; width:100vw; height:100vh; display:block; }
 #spacer { height:800vh; pointer-events:none; }
 
@@ -72,14 +72,14 @@ const canvas   = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
-renderer.setClearColor(0xf5f4f0, 1);
+renderer.setClearColor(0xffffff, 1);
 
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(58, innerWidth/innerHeight, 0.1, 400);
 camera.position.set(0, 8, 52);
 camera.lookAt(0, 0, 0);
 
-scene.fog = new THREE.FogExp2(0xf5f4f0, 0.006);
+scene.fog = new THREE.FogExp2(0xffffff, 0.006);
 
 // ═══════════════════════════════════════════
 // SCROLL — native when standalone, postMessage when in Framer
@@ -139,11 +139,14 @@ uniform float uFreq;
 uniform float uPhaseX;
 uniform float uPhaseZ;
 uniform float uP;
+attribute vec3 aBary;
 varying float vElev;
 varying vec2  vXZ;
+varying vec3  vBary;
 
 void main(){
-  vXZ = position.xz;
+  vXZ  = position.xz;
+  vBary = aBary;
 
   // Two octave wave
   float e  = snoise(vec3(position.x*uFreq + uPhaseX,
@@ -167,45 +170,60 @@ uniform vec3  uColA;
 uniform vec3  uColB;
 varying float vElev;
 varying vec2  vXZ;
+varying vec3  vBary;
 
 void main(){
   float t = smoothstep(-2., 2., vElev);
   vec3 col = mix(uColA, uColB, t);
   float edge = 1. - smoothstep(72., 105., length(vXZ));
+
+  // Soft grid lines baked into solid mesh — much cleaner than wireframe
+  // Pick the minimum barycentric distance → proximity to an edge
+  float bMin = min(vBary.x, min(vBary.y, vBary.z));
+  float lineW = 0.018; // line thickness (barycentric space)
+  float line  = 1. - smoothstep(0., lineW, bMin);
+  // Grid colour: lighter than the surface, always cool-white
+  vec3 gridCol = mix(col * 1.6 + .18, vec3(1.), .35);
+  col = mix(col, gridCol, line * .55);
+
   gl_FragColor = vec4(col, uAlpha * edge);
 }`;
 
-// Wireframe fragment — shows contour lines briefly
+// Wireframe mat no longer needed — lines are baked into solid
 const WIRE_FS = `
-uniform float uP;
 uniform float uWireAlpha;
-uniform vec3  uColA;
-varying float vElev;
-
-void main(){
-  gl_FragColor = vec4(uColA * 1.4, uWireAlpha);
-}`;
+void main(){ gl_FragColor = vec4(1., 1., 1., 0.); }`;
 
 // Each layer definition
 const LAYER_DEFS = [
-  // { yBase, ampMult, freqMult, phX, phZ, colA, colB, wireCol, depthStart, depthEnd }
-  // Layer 0 — top surface, warm gold
-  { y: 0,   amp:1.0, freq:.82, phX:0,   phZ:0,   cA:0xc8921a, cB:0x4a7a9a, wC:0xe8b84a, dS:.04, dE:.55 },
-  // Layer 1 — steel blue, like mid-photo water colour
+  // Layer 0 — top surface: cool silver-white, transitions into the portfolio's clean white bg
+  { y: 0,   amp:1.0, freq:.82, phX:0,   phZ:0,   cA:0xd8dfe8, cB:0x6a9ab8, wC:0xffffff, dS:.04, dE:.55 },
+  // Layer 1 — steel blue
   { y:-4.5, amp:.88, freq:.95, phX:3.1, phZ:1.4, cA:0x3a6888, cB:0x0e2840, wC:0x5a9ac8, dS:.08,  dE:.65 },
-  // Layer 2 — deeper, darker blue
+  // Layer 2 — deeper blue
   { y:-9,   amp:.74, freq:1.1, phX:6.2, phZ:3.0, cA:0x1a5878, cB:0x081828, wC:0x1e90b0, dS:.10,  dE:.72 },
   // Layer 3 — mid depth, navy
   { y:-14,  amp:.58, freq:1.3, phX:1.8, phZ:5.5, cA:0x0e3858, cB:0x040e20, wC:0x1068a0, dS:.22,  dE:.80 },
-  // Layer 4 — deep, near black blue
+  // Layer 4 — deep navy
   { y:-20,  amp:.42, freq:1.5, phX:4.4, phZ:2.2, cA:0x082040, cB:0x020810, wC:0x0848a0, dS:.35,  dE:.88 },
-  // Layer 5 — abyss floor, very dark
+  // Layer 5 — abyss
   { y:-27,  amp:.28, freq:1.8, phX:7.0, phZ:4.8, cA:0x040e1c, cB:0x010408, wC:0x0430a0, dS:.50,  dE:.98 },
 ];
 
 // Shared geometry (all layers reuse same geo)
 const waveGeo = new THREE.PlaneGeometry(220, 220, 130, 130);
 waveGeo.rotateX(-Math.PI / 2);
+
+// Add barycentric coordinates so the fragment shader can draw thick grid lines
+// Each triangle gets corners (1,0,0) (0,1,0) (0,0,1)
+const posAttr  = waveGeo.attributes.position;
+const vertCount = posAttr.count;
+const bary = new Float32Array(vertCount * 3);
+for(let i = 0; i < vertCount; i++){
+  const b = i % 3;
+  bary[i*3 + b] = 1.0;
+}
+waveGeo.setAttribute('aBary', new THREE.BufferAttribute(bary, 3));
 
 const waveLayers = [];
 
@@ -302,8 +320,8 @@ void main(){
   // Warm gold near center, cooler blue-white at edges
   float warm = smoothstep(55., 0., length(pos.xz));
   vC = mix(
-    vec3(.58,.72,.84),
-    mix(vec3(.99,.97,.90), vec3(1.,.82,.38), warm*.7),
+    vec3(.78,.88,.96),
+    mix(vec3(.98,.98,1.0), vec3(1.,.96,.88), warm*.4),
     warm
   );
 
@@ -562,9 +580,9 @@ function updateFog(pp){
   let r, g, b;
   if(pp < .5){
     const t = sm(pp * 2);
-    r = THREE.MathUtils.lerp(245, 2,   t) / 255;
-    g = THREE.MathUtils.lerp(244, 13,  t) / 255;
-    b = THREE.MathUtils.lerp(240, 26,  t) / 255;
+    r = THREE.MathUtils.lerp(255, 2,   t) / 255;
+    g = THREE.MathUtils.lerp(255, 13,  t) / 255;
+    b = THREE.MathUtils.lerp(255, 26,  t) / 255;
   } else {
     const t = sm((pp - .5) * 2);
     r = THREE.MathUtils.lerp(2,  2,  t) / 255;
@@ -598,9 +616,9 @@ function updateWaveLayers(pp, now){
     layer.uni.uTime.value      = now;
     layer.uni.uP.value         = pp;
 
-    // Wire — only on the upper layers, at the transition moments
-    const wireA = a * Math.max(0, .22 - i*.028);
-    layer.wireMat.uniforms.uWireAlpha.value = Math.max(0, wireA);
+    // Wire mesh kept for structure but invisible — lines now baked into solid shader
+    const wireA = 0;
+    layer.wireMat.uniforms.uWireAlpha.value = 0;
     layer.wireMat.uniforms.uTime.value      = now;
 
     // As you descend, layers separate and tilt slightly
