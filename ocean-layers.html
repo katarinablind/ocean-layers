@@ -33,7 +33,7 @@ body { background:#ffffff; overflow-y:scroll; }
 #depth-line { width:1px; height:110px; background:rgba(20,20,20,.08); position:relative; }
 #depth-fill {
   position:absolute; bottom:0; left:0; width:100%;
-  background:linear-gradient(to top, rgba(20,20,20,.45), transparent);
+  background:linear-gradient(to top, rgba(20,20,20,.35), rgba(255,90,40,.12), transparent);
 }
 #depth-val {
   font-size:.72rem; letter-spacing:.08em; color:rgba(20,20,20,.28);
@@ -194,8 +194,8 @@ void main(){ gl_FragColor = vec4(1., 1., 1., 0.); }`;
 
 // Each layer definition
 const LAYER_DEFS = [
-  // Layer 0 — top surface: bright white emerging from page
-  { y: 0,   amp:1.0, freq:.82, phX:0,   phZ:0,   cA:0xe8e8e8, cB:0x909090, wC:0xffffff, dS:.04, dE:.65 },
+  // Layer 0 — top surface: bright white with subtle warm (orange) highlight
+  { y: 0,   amp:1.0, freq:.82, phX:0,   phZ:0,   cA:0xf5ebe0, cB:0x909090, wC:0xffffff, dS:.04, dE:.65 },
   // Layer 1 — mid grey
   { y:-4.5, amp:.88, freq:.95, phX:3.1, phZ:1.4, cA:0x707070, cB:0x303030, wC:0x909090, dS:.18,  dE:.75 },
   // Layer 2 — darker grey
@@ -312,13 +312,13 @@ void main(){
   pos.x += snoise(vec3(aPh*2.,   uTime*.07, 0.))*2.2;
   pos.z += snoise(vec3(aPh*2.+5.,uTime*.06, 1.))*2.2;
 
-  float vis = smoothstep(.05, .18, uP) * (1. - smoothstep(.0, .38, uP));
+    float vis = smoothstep(.05, .18, uP) * (1. - smoothstep(.0, .38, uP));
 
-  // Orange sun column at centre → white-silver sparkles at edges
+  // Orange sun column at centre (brand orange) → white-silver sparkles at edges
   float warm = smoothstep(60., 0., length(pos.xz));
   vC = mix(
     vec3(.88,.88,.88),
-    mix(vec3(1.,.90,.78), vec3(1.,.52,.12), warm*.8),
+    mix(vec3(1.,.90,.78), vec3(1.,.55,.18), warm*.85),
     warm
   );
 
@@ -427,7 +427,7 @@ void main(){
     float vis   = smoothstep(.32,.52,uP)*(1.-smoothstep(.88,1.,uP));
     float pulse = .5+.5*sin(uTime*1.8 + aPh*11.);
     float depthT = smoothstep(0.,-65.,pos.y);
-    vC = mix(vec3(1.,.48,.10), vec3(1.,.65,.26), depthT);
+    vC = mix(vec3(1.,.55,.18), vec3(1.,.68,.28), depthT);
     float sz = (.20+aSz*1.0)*uPR*(195./-(modelViewMatrix*vec4(pos,1.)).z);
     gl_PointSize = max(sz, 0.);
     vA = vis * (.04+aSz*.12) * (.55+.45*pulse);
@@ -499,18 +499,24 @@ void main(){
 scene.add(rayGroup);
 
 // ═══════════════════════════════════════════
-// STARS — appear at the very end, subtle
+// STARS — multiple depth layers: far → mid → near as you scroll deeper into space
+// aDepthBand: 0=far (tiny, many), 1=mid, 2=near (larger, fewer) — different perspectives
 // ═══════════════════════════════════════════
-const STAR_N = 4000;
+const STAR_N = 8000;
 const stPos = new Float32Array(STAR_N * 3);
 const stPh  = new Float32Array(STAR_N);
 const stSz  = new Float32Array(STAR_N);
+const stDepthBand = new Float32Array(STAR_N); // 0 far, 1 mid, 2 near
 for(let i = 0; i < STAR_N; i++){
   const i3 = i*3;
+  const band = i < STAR_N*0.5 ? 0 : i < STAR_N*0.85 ? 1 : 2;
+  stDepthBand[i] = band;
   const a1 = Math.random()*Math.PI*2, a2 = Math.acos(2*Math.random()-1);
-  const r  = 80 + Math.random()*60;
+  const r  = band === 0 ? 100 + Math.random()*80
+            : band === 1 ? 55 + Math.random()*50
+            : 25 + Math.random()*35;
   stPos[i3]   = r*Math.sin(a2)*Math.cos(a1);
-  stPos[i3+1] = r*Math.sin(a2)*Math.sin(a1) * .45; // flatten to disc
+  stPos[i3+1] = r*Math.sin(a2)*Math.sin(a1) * (band === 2 ? .6 : .5);
   stPos[i3+2] = r*Math.cos(a2);
   stPh[i] = Math.random()*Math.PI*2;
   stSz[i] = Math.random();
@@ -519,6 +525,7 @@ const starGeo = new THREE.BufferGeometry();
 starGeo.setAttribute('position', new THREE.BufferAttribute(stPos,3));
 starGeo.setAttribute('aPh',      new THREE.BufferAttribute(stPh, 1));
 starGeo.setAttribute('aSz',      new THREE.BufferAttribute(stSz, 1));
+starGeo.setAttribute('aDepthBand', new THREE.BufferAttribute(stDepthBand, 1));
 
 const starUni = { uTime:{value:0}, uP:{value:0}, uPR:{value:renderer.getPixelRatio()} };
 const starMat = new THREE.ShaderMaterial({
@@ -526,29 +533,39 @@ const starMat = new THREE.ShaderMaterial({
   depthWrite:false, blending:THREE.AdditiveBlending,
   vertexShader:`
 uniform float uTime, uP, uPR;
-attribute float aPh, aSz;
+attribute float aPh, aSz, aDepthBand;
 varying float vA; varying vec3 vC;
 void main(){
   vec3 pos = position;
-  // Slow drift — like they're drifting past
-  pos.x += sin(uTime*.04 + aPh*2.)*1.2;
-  pos.y += cos(uTime*.03 + aPh*3.)*0.8;
+  // Scroll-driven rotation — stars move around as you scroll (deeper into space)
+  float scrollAngle = uP * 6.28318;
+  float c = cos(scrollAngle), s = sin(scrollAngle);
+  pos.xz = mat2(c, s, -s, c) * pos.xz;
+  // Parallax drift — far moves less, near moves more (depth in space)
+  float drift = 1.0 + (2.0 - aDepthBand) * 1.4;
+  pos.x += sin(uTime*.04 + aPh*2.) * 1.0 * drift;
+  pos.y += cos(uTime*.03 + aPh*3.) * 0.6 * drift;
 
-  // Only appear in the last 25% of scroll
-  float vis = smoothstep(.75, .92, uP);
-  float twinkle = .55 + .45*sin(uTime*2.8 + aPh*17.);
-  vA = vis * twinkle * (.25 + aSz*.6);
+  // Far layer fades in first (0.58), then mid (0.72), then near (0.82) — deeper scroll = deeper into space
+  float visFar  = smoothstep(.58, .78, uP) * (1. - smoothstep(.92, 1., uP) * 0.3);
+  float visMid  = smoothstep(.72, .88, uP);
+  float visNear = smoothstep(.82, .95, uP);
+  float vis = aDepthBand < 0.5 ? visFar : aDepthBand < 1.5 ? visMid : visNear;
 
-  // Mostly pure white stars, rare orange accent
+  float twinkle = .5 + .5*sin(uTime*2.8 + aPh*17.);
+  float sizeMult = aDepthBand < 0.5 ? 0.5 : aDepthBand < 1.5 ? 1.0 : 2.2;
+  vA = vis * twinkle * (.2 + aSz*.55) * sizeMult;
+
+  // White majority; meaningful orange accent (your brand orange)
   float hue = fract(aPh*.31);
   vC = mix(
-    vec3(.92,.92,.92),                        // white
-    vec3(1.,.50,.15),                         // orange accent (rare)
-    step(.92, hue)
+    vec3(.92,.92,.94),
+    vec3(1.,.55,.18),
+    step(.88, hue)
   );
 
   vec4 mv = modelViewMatrix * vec4(pos, 1.);
-  gl_PointSize = (.5 + aSz*1.8) * uPR * (180. / -mv.z);
+  gl_PointSize = (.4 + aSz*1.4) * sizeMult * uPR * (180. / -mv.z);
   gl_Position  = projectionMatrix * mv;
 }`,
   fragmentShader:`
@@ -567,16 +584,13 @@ scene.add(new THREE.Points(starGeo, starMat));
 // ═══════════════════════════════════════════
 function sm(t){ return t*t*(3-2*t); }
 
-function updateCamera(pp){
-  const now = performance.now()*.001;
-  // Surface: high up, looking slightly down at waves
-  // Deep: descend, tilt down, pull back slightly
-  const y  = THREE.MathUtils.lerp( 8,  -30, pp);
+function updateCamera(pp, now){
+  // Surface: high up, looking slightly down at waves. Deep: descend, tilt down, pull back slightly
+  const y  = THREE.MathUtils.lerp( 8,  -38, pp);
   const z  = THREE.MathUtils.lerp(52,   64, Math.min(pp*2,1));
   const rx = THREE.MathUtils.lerp( 0, -.10, Math.min(pp/.6,1));
   const fv = THREE.MathUtils.lerp(58,   66, pp);
 
-  // Idle bob and sway at surface — feels like you're floating
   const bob  = Math.sin(now*.6) * .28 * (1-Math.min(pp*5,1));
   const swayX= Math.sin(now*.22)* .7  * (1-Math.min(pp*3,1));
 
@@ -587,14 +601,13 @@ function updateCamera(pp){
 }
 
 function updateFog(pp){
-  // Stay white much longer — only start going dark after 60% scroll
-  let r, g, b;
-  const delayedP = Math.max(0, (pp - 0.55) / 0.45); // don't darken until 55%
-  const t = sm(Math.min(delayedP * 2, 1));
-  r = g = b = THREE.MathUtils.lerp(1.0, 0.01, t);
+  // Fade to black as soon as under the first surface
+  const t = sm(Math.min(pp / 0.18, 1));
+  const r = THREE.MathUtils.lerp(1.0, 0.018, t);
+  const g = THREE.MathUtils.lerp(1.0, 0.008, t);
+  const b = THREE.MathUtils.lerp(1.0, 0.002, t);
   scene.fog.color.setRGB(r, g, b);
-  // Fog stays very thin at surface so waves are crisp, thickens slowly
-  scene.fog.density = THREE.MathUtils.lerp(.001, .022, Math.min(pp * 1.2, 1));
+  scene.fog.density = THREE.MathUtils.lerp(.001, .026, Math.min(pp / 0.22, 1));
   renderer.setClearColor(scene.fog.color, 1);
 }
 
@@ -614,19 +627,15 @@ function updateWaveLayers(pp, now){
     const def = layer.def;
     const a = fadeRange(pp, def.dS, def.dE);
 
-    // Solid — deeper layers are more transparent; all fade in from white (start at 0)
     const solidA = a * (.50 - i*.04);
     layer.uni.uAlpha.value     = Math.max(0, solidA);
     layer.uni.uTime.value      = now;
     layer.uni.uP.value         = pp;
 
-    // Wire mesh kept for structure but invisible — lines now baked into solid shader
-    const wireA = 0;
     layer.wireMat.uniforms.uWireAlpha.value = 0;
     layer.wireMat.uniforms.uTime.value      = now;
 
-    // As you descend, layers separate and tilt slightly
-    const sep = sm(Math.max(0, (pp-.1)/.5)); // starts separating at 10%
+    const sep = sm(Math.max(0, (pp-.1)/.5));
     layer.solidMesh.position.y = def.y - sep * i * 1.2;
     layer.wireMesh.position.y  = layer.solidMesh.position.y;
 
@@ -649,13 +658,17 @@ function updateHUD(pp){
     const d = Math.round(pp*pp*1300);
     depthValEl.textContent = d>0 ? d.toLocaleString()+'m' : '0m';
   }
-  // Shift HUD text dark→light as bg goes white→dark
-  const light = Math.min(1, Math.max(0, (pp-.1)/.15));
-  const hudColor = `rgba(${Math.round(255*light)},${Math.round(255*light)},${Math.round(255*light)},${.3+light*.35})`;
+  const light = Math.min(1, Math.max(0, (pp-.03)/.18));
+  const useOrange = pp > 0.62;
+  const R = useOrange ? Math.round(255*light + (1-light)*255) : Math.round(255*light);
+  const G = useOrange ? Math.round(255*light + (1-light)*140) : Math.round(255*light);
+  const B = useOrange ? Math.round(255*light + (1-light)*46)  : Math.round(255*light);
+  const hudColor = `rgba(${R},${G},${B},${.32+light*.4})`;
   depthValEl.style.color    = hudColor;
   document.getElementById('depth-lbl').style.color = hudColor;
+  const fillMid = useOrange ? ' rgba(255,90,40,.2),' : '';
   document.getElementById('depth-fill').style.background =
-    `linear-gradient(to top, ${hudColor}, transparent)`;
+    `linear-gradient(to top, ${hudColor}, ${fillMid} transparent)`;
 }
 
 // ═══════════════════════════════════════════
@@ -677,7 +690,7 @@ window.addEventListener('resize',()=>{
   requestAnimationFrame(loop);
   const now = performance.now()*.001;
 
-  p += (rawP-p)*.028;
+  p = THREE.MathUtils.lerp(p, rawP, 0.032);
 
 
   // Shimmer uniforms
@@ -692,14 +705,13 @@ window.addEventListener('resize',()=>{
   starUni.uTime.value = now;
   starUni.uP.value    = p;
 
-  // Ray uniforms
   rayMats.forEach(m=>{ m.uniforms.uP.value=p; m.uniforms.uTime.value=now; });
 
   // Wave layers
   updateWaveLayers(p, now);
 
   updateFog(p);
-  updateCamera(p);
+  updateCamera(p, now);
   updateHUD(p);
 
   renderer.render(scene, camera);
